@@ -297,3 +297,60 @@ textarea.input { resize: vertical; }
   .sidebar { width: 64px; }
   .logo div, .sidebar nav a:not(.active), .sidebar-footer { display: none; }
 }
+
+/* ---------- 供应商资源池 ---------- */
+.pool-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
+.pool-card {
+  background: #fff; border-radius: var(--radius); box-shadow: var(--shadow); padding: 14px 16px;
+  display: flex; flex-direction: column; gap: 7px; border-top: 3px solid var(--teal);
+}
+.pool-card.is-tight { border-top-color: var(--orange); }
+.pool-card.is-soldout { border-top-color: var(--red); opacity: .92; }
+.pool-card h3 { font-size: 14.5px; }
+.pool-card h3 small { color: var(--ink-3); font-weight: 400; }
+.pool-card-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+.pool-card-top > div:first-child { display: flex; gap: 6px; flex-wrap: wrap; }
+.pool-avail { font-size: 18px; margin-top: 2px; }
+.pool-avail small { font-size: 12px; font-weight: 400; color: var(--ink-3); }
+.pool-price { font-size: 13px; color: var(--ink-2); }
+.pool-price small { color: var(--ink-3); }
+.mini-days { display: flex; gap: 3px; }
+.mini-days i { flex: 1; height: 7px; border-radius: 3px; background: #dcfce7; }
+.mini-days i.st-low { background: #fed7aa; }
+.mini-days i.st-zero { background: #fecaca; }
+
+.st-ok { color: #15803d; }
+.st-low { color: #c2410c; }
+.st-zero { color: #b91c1c; }
+
+.stock-days { display: flex; gap: 8px; overflow-x: auto; padding: 4px 0 8px; }
+.stock-day {
+  min-width: 78px; border: 1px solid var(--line); border-radius: 9px; padding: 8px 10px;
+  display: flex; flex-direction: column; gap: 4px; background: #fcfdfe;
+}
+.stock-day.st-ok { border-color: #bbf7d0; background: #f0fdf4; }
+.stock-day.st-low { border-color: #fed7aa; background: #fff7ed; }
+.stock-day.st-zero { border-color: #fecaca; background: #fef2f2; }
+.stock-date { font-size: 11.5px; color: var(--ink-3); }
+.stock-num { font-size: 17px; font-weight: 700; }
+.stock-num small { font-size: 11px; font-weight: 400; color: var(--ink-3); }
+.stock-bar { height: 6px; border-radius: 4px; background: #e2e8f0; overflow: hidden; }
+.stock-bar i { display: block; height: 100%; background: linear-gradient(90deg, #fbbf24, var(--orange)); }
+.stock-held { font-size: 10.5px; color: var(--ink-3); white-space: nowrap; }
+
+.pool-detail-meta { display: flex; gap: 18px; flex-wrap: wrap; font-size: 13px; color: var(--ink-2); margin-bottom: 12px; }
+.pool-sub { margin: 14px 0 8px; font-size: 13.5px; color: var(--ink); }
+.pool-preview { border-top: 1px dashed var(--line); margin-top: 14px; padding-top: 12px; }
+.pool-preview-head { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+
+.pool-section { border-left: 4px solid var(--teal); }
+.pool-tip {
+  margin-top: 12px; font-size: 12.5px; color: var(--teal-dark); background: #f0fdfa;
+  border: 1px dashed #99f6e4; border-radius: 8px; padding: 10px 14px; line-height: 1.7;
+}
+.row-pool { background: #f0fdfa; }
+.row-pool:hover { background: #ccfbf1 !important; }
+.pool-link { font-size: 12px; }
+.released-box { margin-top: 10px; border-top: 1px dashed var(--line); padding-top: 8px; }
+.released-box summary { cursor: pointer; font-size: 12.5px; color: var(--ink-3); padding: 4px 0; }
+

@@ -1,5 +1,6 @@
 node_modules/
 data/
+tmp-test/
 client/dist/
 *.log
 .DS_Store

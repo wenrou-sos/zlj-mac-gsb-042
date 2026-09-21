@@ -4,6 +4,7 @@ import { useToast } from '../Toast.jsx';
 import Modal from '../Modal.jsx';
 import { ConfirmBadge, Empty } from '../ui.jsx';
 import { nightsBetween } from './opsUtils.js';
+import ResourceAllocations from './ResourceAllocations.jsx';
 
 /* ---------------- 航空切位 ---------------- */
 function Flights({ tour, reload }) {
@@ -33,16 +34,20 @@ function Flights({ tour, reload }) {
           <thead><tr><th>方向</th><th>航班号</th><th>日期</th><th>航线</th><th>座位</th><th>切位价</th><th>小计</th><th>状态</th><th></th></tr></thead>
           <tbody>
             {tour.flights.map(f => (
-              <tr key={f.id}>
+              <tr key={f.id} className={f.allocation_id ? 'row-pool' : ''}>
                 <td><span className="tag">{f.direction}</span></td>
-                <td className="mono"><strong>{f.flight_no}</strong></td>
+                <td className="mono"><strong>{f.flight_no}</strong>{f.allocation_id && <span className="pool-link" title="来自供应商资源池"> 📦</span>}</td>
                 <td className="small">{f.flight_date || '—'}</td>
                 <td className="small">{f.route || '—'}</td>
-                <td>{f.seats}</td><td>{yuan(f.unit_price)}</td>
+                <td>{f.seats}</td><td>{yuan(f.unit_price)}{f.confirmed && f.allocation_id ? <small> 🔒</small> : null}</td>
                 <td><strong>{yuan(f.seats * f.unit_price)}</strong></td>
                 <td><ConfirmBadge confirmed={!!f.confirmed} /></td>
-                <td className="nowrap"><button className="btn btn-xs" onClick={() => toggle(f)}>{f.confirmed ? '撤销确认' : '确认'}</button>
-                  <button className="btn btn-xs btn-danger-ghost" onClick={() => del(f)}>删</button></td>
+                <td className="nowrap">
+                  {f.allocation_id
+                    ? <a className="btn btn-xs" href="#resources">资源池管理</a>
+                    : <><button className="btn btn-xs" onClick={() => toggle(f)}>{f.confirmed ? '撤销确认' : '确认'}</button>
+                      <button className="btn btn-xs btn-danger-ghost" onClick={() => del(f)}>删</button></>}
+                </td>
               </tr>
             ))}
           </tbody>
@@ -103,14 +108,18 @@ function Hotels({ tour, reload }) {
             {tour.hotels.map(h => {
               const n = nightsBetween(h.check_in, h.check_out);
               return (
-                <tr key={h.id}>
-                  <td><strong>{h.hotel_name}</strong></td><td><span className="tag">{h.room_type}</span></td>
+                <tr key={h.id} className={h.allocation_id ? 'row-pool' : ''}>
+                  <td><strong>{h.hotel_name}</strong>{h.allocation_id && <span className="pool-link" title="来自供应商资源池"> 📦</span>}</td><td><span className="tag">{h.room_type}</span></td>
                   <td>{h.rooms}</td><td className="small">{h.check_in}</td><td className="small">{h.check_out}</td>
-                  <td>{n} 晚</td><td>{yuan(h.night_price)}</td>
+                  <td>{n} 晚</td><td>{yuan(h.night_price)}{h.confirmed && h.allocation_id ? <small> 🔒</small> : null}</td>
                   <td><strong>{yuan(h.rooms * h.night_price * n)}</strong></td>
                   <td><ConfirmBadge confirmed={!!h.confirmed} /></td>
-                  <td className="nowrap"><button className="btn btn-xs" onClick={() => toggle(h)}>{h.confirmed ? '撤销确认' : '确认'}</button>
-                    <button className="btn btn-xs btn-danger-ghost" onClick={() => del(h)}>删</button></td>
+                  <td className="nowrap">
+                    {h.allocation_id
+                      ? <a className="btn btn-xs" href="#resources">资源池管理</a>
+                      : <><button className="btn btn-xs" onClick={() => toggle(h)}>{h.confirmed ? '撤销确认' : '确认'}</button>
+                        <button className="btn btn-xs btn-danger-ghost" onClick={() => del(h)}>删</button></>}
+                  </td>
                 </tr>
               );
             })}
@@ -165,7 +174,7 @@ function LocalServices({ tour, reload }) {
           {tour.local_services.map(s => (
             <div className={`local-card ${s.confirmed ? 'confirmed' : ''}`} key={s.id}>
               <div className="local-card-head">
-                <strong>{s.agency_name}</strong><ConfirmBadge confirmed={!!s.confirmed} />
+                <strong>{s.agency_name}{s.allocation_id && <span className="pool-link" title="来自供应商资源池"> 📦</span>}</strong><ConfirmBadge confirmed={!!s.confirmed} />
               </div>
               <div className="local-rows">
                 <div><span>地接导游</span>{s.guide_name || '—'}{s.guide_phone && <em className="mono"> {s.guide_phone}</em>}</div>
@@ -175,8 +184,10 @@ function LocalServices({ tour, reload }) {
                 {s.remarks && <div><span>备注</span>{s.remarks}</div>}
               </div>
               <div className="local-actions">
-                <button className="btn btn-xs" onClick={() => toggle(s)}>{s.confirmed ? '撤销确认' : '确认地接'}</button>
-                <button className="btn btn-xs btn-danger-ghost" onClick={() => del(s)}>删除</button>
+                {s.allocation_id
+                  ? <a className="btn btn-xs" href="#resources">资源池管理</a>
+                  : <><button className="btn btn-xs" onClick={() => toggle(s)}>{s.confirmed ? '撤销确认' : '确认地接'}</button>
+                    <button className="btn btn-xs btn-danger-ghost" onClick={() => del(s)}>删除</button></>}
               </div>
             </div>
           ))}
@@ -243,6 +254,7 @@ function OtherCosts({ tour, reload }) {
 export default function OpsTab({ tour, reload }) {
   return (
     <div className="ops-tab">
+      <ResourceAllocations tour={tour} reload={reload} />
       <Flights tour={tour} reload={reload} />
       <Hotels tour={tour} reload={reload} />
       <LocalServices tour={tour} reload={reload} />

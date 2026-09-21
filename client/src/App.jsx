@@ -5,11 +5,13 @@ import ProductEdit from './pages/ProductEdit.jsx';
 import Tours from './pages/Tours.jsx';
 import TourNew from './pages/TourNew.jsx';
 import TourDetail from './pages/TourDetail.jsx';
+import ResourcePool from './pages/ResourcePool.jsx';
 
 const NAV = [
   { hash: '#/', label: '工作台', icon: '🏠' },
   { hash: '#/products', label: '旅游产品', icon: '🗺️' },
-  { hash: '#/tours', label: '团队收客', icon: '👥' }
+  { hash: '#/tours', label: '团队收客', icon: '👥' },
+  { hash: '#/resources', label: '供应商资源池', icon: '📦' }
 ];
 
 function parseHash() {
@@ -34,6 +36,7 @@ export default function App() {
   else if (a === 'tours' && !b) page = <Tours />;
   else if (a === 'tours' && b === 'new') page = <TourNew />;
   else if (a === 'tours' && /^\d+$/.test(b)) page = <TourDetail id={b} />;
+  else if (a === 'resources') page = <ResourcePool />;
   else page = <Dashboard />;
 
   return (

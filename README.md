@@ -8,9 +8,12 @@
 
 ```bash
 npm run install:all     # 安装后端与前端依赖
-npm run seed            # 写入演示数据（2条线路、2个团、27名游客、全套计调资源）
+npm run seed            # 写入演示数据（2条线路、2个团、37名游客、5家供应商、6条采购资源、7条占用）
 npm run dev             # 同时启动 API(4000) 与前端开发服务器(5173)
+npm test                # 运行库存冲突/并发/跨日期控房/释放/成本快照测试（独立临时库）
 ```
+
+> 如本机 better-sqlite3 需要本地编译，可指定系统编译器：`CC=/usr/bin/gcc CXX=/usr/bin/g++ npm install`
 
 打开 http://localhost:5173 （开发模式自动代理 `/api`）。
 
@@ -36,10 +39,23 @@ npm run build && npm start   # http://localhost:4000 直接访问
 - 收客进度条、房型人数与报名费收入实时统计
 
 ### 3. 计调操作（计调部）
-- **航空切位**：去/回程航班号、日期、航线、切位座位数、切位价，待确认/已确认
+- **资源池占位（推荐）**：从供应商资源池选择航班座位/酒店房量/地接容量发起占用，联动生成计调记录；状态流转 **待确认 → 已确认 → 已释放**
+- **航空切位**：去/回程航班号、日期、航线、切位座位数、切位价，待确认/已确认（支持资源池占位与手工录入两种方式）
 - **酒店控房**：酒店、房型、间数、入住/离店日期、晚均价；自动按晚数计成本
 - **地接社确认**：地接社、地接导游及电话、用车、用餐安排、打包费用、确认状态
 - **其他成本**：门票、保险、领队费用等杂项
+- **手工兼容**：未关联资源池的历史/手工计调记录保持原有全部行为，不受库存校验约束（表中以 📦 标识资源池联动行）
+
+### 3.5 供应商资源池与库存冲突控制
+- **供应商**：航司/包机商、酒店、地接社三类，统一维护联系人、合作状态
+- **采购资源（库存）**：供应商、日期、采购数量、采购单价、状态（在售/停售）；酒店为「起始入住日~离店日 + **每日房量**」
+- **实时余量**：余量 = 采购量 − 所有有效占用（待确认 + 已确认，已释放不计）；酒店**按入住日期逐日校验**（离店日不占房），跨日期占用仅占用区间内的日期
+- **超卖防护**：创建/修改/确认占用均在数据库事务（`BEGIN IMMEDIATE` + busy_timeout 串行化）内完成，先校验余量再写入；并发请求不会超卖
+- **冲突响应**：HTTP 409 返回每个冲突日期的采购量/已占用/剩余量/缺口，例如
+  `「三亚亚特兰蒂斯酒店」库存冲突：2026-10-03（余量 10/20，缺 5）`
+- **成本快照**：确认占用时按当时采购单价锁定 `price_snapshot` 与 `cost_snapshot`；之后供应商调价**不影响已确认团队毛利**。待确认占用的计调行单价跟随采购价浮动；确认后即冻结
+- **释放规则**：① 计调手工释放 → 删除联动计调行、恢复余量；② 游客全部退团 → 自动释放该团**待确认**占用（已确认涉及供应商成约，保留由计调处理）；③ 删除采购资源 → 事务内释放全部有效占用；④ 删除/取消团队 → 释放全部占用
+- 团队计调页展示实时余量（含逐日视图）、占用来源团队、超卖红色冲突提示；已释放记录保留审计留痕
 
 ### 4. 收入 vs 成本毛利估算（单团实时）
 - 收入：在团游客实收团费合计
@@ -55,15 +71,18 @@ npm run build && npm start   # http://localhost:4000 直接访问
 
 ```
 server/
-  index.js     Express 入口（API + 生产静态托管）
-  db.js        SQLite 表结构（products/itinerary_days/tours/tourists/
-               flight_bookings/hotel_bookings/local_services/other_costs/notices）
-  routes.js    全部业务接口与校验、满团规则、通知书文案生成
-  helpers.js   身份证校验、财务计算、团号生成
-  seed.js      演示数据
+  index.js          Express 入口（API + 生产静态托管）
+  db.js             SQLite 表结构（products/itinerary_days/tours/tourists/
+                    flight_bookings/hotel_bookings/local_services/other_costs/notices/
+                    suppliers/resources/resource_allocations）
+  inventory.js      资源池核心：事务占用/确认/释放、逐日余量、冲突检测、成本快照
+  routes.js         全部业务接口与校验、满团规则、资源池 API、通知书文案生成
+  helpers.js        身份证校验、财务计算、团号生成
+  inventory.test.js 并发占用/跨日期控房/释放规则/成本快照测试（node --test）
+  seed.js           演示数据
 client/src/
-  pages/       工作台、产品列表/编辑、团队列表/新建/详情
-  components/tour/  团队详情四个标签页：收客 / 计调 / 财务 / 通知书
+  pages/            工作台、产品列表/编辑、团队列表/新建/详情、供应商资源池
+  components/tour/  团队详情标签页：收客 / 计调(含资源池占用) / 财务 / 通知书
 ```
 
 ## 主要 API
@@ -71,10 +90,17 @@ client/src/
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET/POST | `/api/products` `/api/products/:id` | 产品 CRUD（含 itinerary 日程数组） |
-| GET/POST | `/api/tours` `/api/tours/:id` | 团队列表/详情（聚合游客、计调、财务） |
+| GET/POST | `/api/tours` `/api/tours/:id` | 团队列表/详情（聚合游客、计调、占用、财务） |
 | POST | `/api/tours/:id/tourists` | 报名（满团/校验/去重拦截） |
-| PATCH/DELETE | `/api/tourists/:id` | 退团、修改、删除 |
-| POST | `/api/tours/:id/flights` `/hotels` `/local-services` `/other-costs` | 计调资源 |
+| PATCH/DELETE | `/api/tourists/:id` | 退团（整团退完自动释放待确认占用）、修改、删除 |
+| POST | `/api/tours/:id/flights` `/hotels` `/local-services` `/other-costs` | 手工计调资源（兼容旧流程） |
+| GET/POST/PUT/DELETE | `/api/suppliers` `/api/suppliers/:id` | 供应商 |
+| GET/POST/PUT/DELETE | `/api/resources` `/api/resources/:id` | 采购资源（改量/改期会校验既有占用） |
+| GET | `/api/resources/:id/availability` | 逐日余量 + 占用来源 |
+| GET/POST | `/api/allocations` | 占用列表（可按 tour/resource/status 过滤）/创建占用（事务，409 返冲突日期与余量） |
+| PUT | `/api/allocations/:id` | 修改待确认占用（数量/日期，重新做冲突校验） |
+| POST | `/api/allocations/:id/confirm` | 确认占用（事务 + 锁定成本快照） |
+| POST | `/api/allocations/:id/release` | 释放占用（删联动计调行、恢复余量） |
 | POST | `/api/tours/:id/notices/generate` | 自动生成通知书文案 |
 | POST | `/api/notices/:id/send` | 发送（模拟网关） |
 | GET | `/api/stats` | 工作台汇总 |

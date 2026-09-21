@@ -1,9 +1,11 @@
 /* 初始化演示数据：npm run seed */
 const db = require('./db');
+const inv = require('./inventory');
 
 db.exec(`DELETE FROM notices; DELETE FROM other_costs; DELETE FROM local_services;
 DELETE FROM hotel_bookings; DELETE FROM flight_bookings; DELETE FROM tourists;
 DELETE FROM tours; DELETE FROM itinerary_days; DELETE FROM products;
+DELETE FROM resource_allocations; DELETE FROM resources; DELETE FROM suppliers;
 DELETE FROM sqlite_sequence;`);
 
 const insP = db.prepare(`INSERT INTO products (name, days, departure_city, destination, price_double, price_triple, price_child, description)
@@ -96,7 +98,7 @@ const tourists2 = [
 ];
 tourists2.forEach(t => insTr.run(t2, ...t));
 
-// 团1 计调资源
+// 团1 计调资源（手工计调记录，兼容旧流程：无资源池联动）
 const insF = db.prepare(`INSERT INTO flight_bookings (tour_id, direction, flight_no, flight_date, route, seats, unit_price, confirmed)
   VALUES (?,?,?,?,?,?,?,?)`);
 insF.run(t1, '去程', 'MU5802', '2026-10-01', '上海虹桥 → 昆明长水', 32, 680, 1);
@@ -115,10 +117,65 @@ db.prepare(`INSERT INTO local_services (tour_id, agency_name, guide_name, guide_
 db.prepare('INSERT INTO other_costs (tour_id, item, amount, remarks) VALUES (?,?,?,?)')
   .run(t1, '玉龙雪山索道及进山费', 28 * 190, '按 28 人预估，含云杉坪索道');
 
-// 团2 部分计调资源（待确认状态，用于演示）
+// 团2 部分手工计调资源（待确认状态）
 insF.run(t2, '去程', 'CZ3869', '2026-10-02', '杭州萧山 → 三亚凤凰', 22, 520, 0);
 insH.run(t2, '三亚亚特兰蒂斯酒店', '海景双床房', 11, '2026-10-02', '2026-10-06', 680, 0);
 db.prepare('INSERT INTO other_costs (tour_id, item, amount, remarks) VALUES (?,?,?,?)')
   .run(t2, '旅行社责任险', 22 * 30, '按 22 席位预估');
 
-console.log('种子数据已写入：2 个产品、2 个团队、37 名游客及计调资源（团2部分待确认）');
+/* ================= 供应商资源池演示 ================= */
+const insSup = db.prepare(`INSERT INTO suppliers (name, type, contact, phone, status, remarks)
+  VALUES (?,?,?,?,?,?)`);
+const supAir = insSup.run('东方航空包机中心', '航班', '陈经理', '13900010001', '合作中', '华东片区切位协议价').lastInsertRowid;
+const supAir2 = insSup.run('南方航空旅游渠道部', '航班', '黄主管', '13900010002', '合作中', '').lastInsertRowid;
+const supHotel = insSup.run('三亚亚特兰蒂斯酒店采购部', '酒店', '林小姐', '13900020001', '合作中', '国庆控房 40 间/天').lastInsertRowid;
+const supHotel2 = insSup.run('昆明锦江大酒店', '酒店', '周总监', '13900020002', '合作中', '').lastInsertRowid;
+const supLocal = insSup.run('海南椰风地接社', '地接', '吴社长', '13900030001', '合作中', '大巴+导游+用餐打包').lastInsertRowid;
+
+const insRes = db.prepare(`INSERT INTO resources
+  (supplier_id, type, name, sub_name, route, direction, service_date, end_date, qty, unit_price, status, remarks)
+  VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`);
+// 航班库存
+const resFlightGo = insRes.run(supAir2, '航班', 'CZ3869', '', '杭州萧山 → 三亚凤凰', '去程',
+  '2026-10-02', null, 25, 520, '在售', '国庆包机切位').lastInsertRowid;
+const resFlightBack = insRes.run(supAir2, '航班', 'CZ3870', '', '三亚凤凰 → 杭州萧山', '回程',
+  '2026-10-06', null, 25, 560, '在售', '').lastInsertRowid;
+const resFlightTight = insRes.run(supAir, '航班', 'MU5802', '', '上海虹桥 → 昆明长水', '去程',
+  '2026-10-01', null, 30, 680, '在售', '紧张航线，先到先得').lastInsertRowid;
+// 酒店库存（每日房量，按入住日逐日扣减）
+const resHotelAtl = insRes.run(supHotel, '酒店', '三亚亚特兰蒂斯酒店', '海景双床房', '', '',
+  '2026-10-02', '2026-10-06', 20, 680, '在售', '10/2-10/5 共4晚').lastInsertRowid;
+const resHotelKun = insRes.run(supHotel2, '酒店', '昆明锦江大酒店', '标间', '', '',
+  '2026-10-01', '2026-10-03', 25, 320, '在售', '').lastInsertRowid;
+// 地接容量（按团计）
+const resLocal = insRes.run(supLocal, '地接', '三亚5日地接打包（33座大巴+导游）', '', '33座空调旅游大巴', '',
+  '2026-10-02', null, 3, 8800, '在售', '同期最多接待 3 个团').lastInsertRowid;
+
+// 团2 从资源池占位：去程 20 座、回程 20 座、酒店 10 间×4晚、地接 1 团
+// 其中去程与酒店直接确认（锁定成本快照），回程/地接待确认
+inv.createAllocationTxn({ resource_id: resFlightGo, tour_id: t2, qty: 20, create_booking: 0, remarks: '团2切位' });
+const aGo = db.prepare("SELECT id FROM resource_allocations WHERE resource_id=? AND tour_id=?").get(resFlightGo, t2).id;
+inv.confirmAllocationTxn(aGo);
+
+inv.createAllocationTxn({ resource_id: resFlightBack, tour_id: t2, qty: 20, create_booking: 0, remarks: '团2回程位' });
+
+inv.createAllocationTxn({
+  resource_id: resHotelAtl, tour_id: t2, qty: 10,
+  start_date: '2026-10-02', end_date: '2026-10-06', create_booking: 0, remarks: '团2控房'
+});
+const aHotel = db.prepare("SELECT id FROM resource_allocations WHERE resource_id=? AND tour_id=?").get(resHotelAtl, t2).id;
+inv.confirmAllocationTxn(aHotel);
+
+inv.createAllocationTxn({ resource_id: resLocal, tour_id: t2, qty: 1, create_booking: 0, remarks: '团2地接' });
+
+// 团1 也从紧张航线占位 28 座并确认，演示跨团队余量与占用来源
+inv.createAllocationTxn({ resource_id: resFlightTight, tour_id: t1, qty: 28, create_booking: 0, remarks: '团1切位' });
+const aTight = db.prepare("SELECT id FROM resource_allocations WHERE resource_id=? AND tour_id=?").get(resFlightTight, t1).id;
+inv.confirmAllocationTxn(aTight);
+// 团1 再占昆明酒店 12 间×1晚（待确认），与手工计调记录并存演示兼容
+inv.createAllocationTxn({
+  resource_id: resHotelKun, tour_id: t1, qty: 12,
+  start_date: '2026-10-01', end_date: '2026-10-02', create_booking: 0, remarks: '团1加房'
+});
+
+console.log('种子数据已写入：2 个产品、2 个团队、37 名游客、5 家供应商、6 条采购资源及 7 条资源池占用（含待确认/已确认）');

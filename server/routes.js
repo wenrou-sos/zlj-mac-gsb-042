@@ -1,8 +1,20 @@
 const express = require('express');
 const db = require('./db');
-const { validIdCard, validPhone, calcFinance, generateTourCode } = require('./helpers');
+const { validIdCard, validPhone, calcFinance, generateTourCode, nightsBetween } = require('./helpers');
+const inv = require('./inventory');
 
 const router = express.Router();
+
+// 统一处理库存事务错误：409 + 剩余量与具体冲突日期
+function handleTxn(res, fn) {
+  try { return fn(); }
+  catch (e) {
+    if (e instanceof inv.InventoryError) {
+      return res.status(e.status).json({ error: e.message, ...e.details });
+    }
+    throw e;
+  }
+}
 
 /* ---------------- 仪表盘 ---------------- */
 router.get('/stats', (req, res) => {
@@ -136,6 +148,24 @@ router.get('/tours/:id', (req, res) => {
   t.hotels = db.prepare('SELECT * FROM hotel_bookings WHERE tour_id=?').all(t.id);
   t.local_services = db.prepare('SELECT * FROM local_services WHERE tour_id=?').all(t.id);
   t.other_costs = db.prepare('SELECT * FROM other_costs WHERE tour_id=?').all(t.id);
+  const allocRows = db.prepare(`
+    SELECT a.*, r.type AS resource_type, r.name AS resource_name, r.sub_name AS resource_sub,
+           r.route AS resource_route, r.qty AS resource_qty, r.unit_price AS resource_price,
+           r.status AS resource_status, s.name AS supplier_name
+    FROM resource_allocations a
+    JOIN resources r ON r.id = a.resource_id
+    JOIN suppliers s ON s.id = r.supplier_id
+    WHERE a.tour_id=? ORDER BY
+      CASE a.status WHEN '待确认' THEN 0 WHEN '已确认' THEN 1 ELSE 2 END, r.type, a.id`).all(t.id);
+  // 每个资源只计算一次余量，附到该团各占用的日期窗口上
+  const avCache = new Map();
+  t.allocations = allocRows.map(a => {
+    if (a.status === '已释放') return { ...a, availability: null };
+    if (!avCache.has(a.resource_id)) avCache.set(a.resource_id, inv.getAvailability(a.resource_id));
+    const av = avCache.get(a.resource_id);
+    const dates = a.resource_type === '酒店' ? inv.dateList(a.start_date, a.end_date) : [a.start_date];
+    return { ...a, availability: av.daily.filter(d => dates.includes(d.date)) };
+  });
   t.notices = db.prepare('SELECT id, sent, sent_at, recipient_count, created_at FROM notices WHERE tour_id=? ORDER BY id DESC').all(t.id);
   const active = t.tourists.filter(x => x.status !== '已退团');
   t.headcount = active.length;
@@ -177,8 +207,18 @@ router.patch('/tours/:id', (req, res) => {
 });
 
 router.delete('/tours/:id', (req, res) => {
-  db.prepare('DELETE FROM tours WHERE id=?').run(req.params.id);
-  res.json({ ok: true });
+  const id = req.params.id;
+  if (!db.prepare('SELECT id FROM tours WHERE id=?').get(id)) return res.status(404).json({ error: '团队不存在' });
+  // 取消/删除团队：先释放全部有效占用（联动删除计调表行），再删团
+  const releaseAndDelete = db.transaction(() => {
+    const rows = db.prepare(
+      "SELECT id FROM resource_allocations WHERE tour_id=? AND status IN ('待确认','已确认')"
+    ).all(id);
+    rows.forEach(a => inv.releaseAllocationTxn(a.id, '团队取消/删除，库存释放'));
+    db.prepare('DELETE FROM tours WHERE id=?').run(id);
+  });
+  releaseAndDelete();
+  res.json({ ok: true, released: db.prepare('SELECT changes() c').get().c });
 });
 
 /* ---------------- 收客 / 游客 ---------------- */
@@ -221,12 +261,31 @@ router.patch('/tourists/:id', (req, res) => {
   for (const f of fields) if (b[f] !== undefined) tr[f] = b[f];
   db.prepare(`UPDATE tourists SET name=?,id_card=?,phone=?,room_type=?,special_needs=?,price=?,status=? WHERE id=?`)
     .run(tr.name, tr.id_card, tr.phone, tr.room_type, tr.special_needs, tr.price, tr.status, tr.id);
-  res.json({ ok: true });
+
+  // 退团规则：整团在团人数归零时，自动释放该团「待确认」占用（可继续卖给其他团）；
+  // 已确认占用涉及与供应商的成约/成本快照，保留由计调手工释放，避免擅自违约。
+  let released = [];
+  if (b.status === '已退团') {
+    const left = db.prepare("SELECT COUNT(*) c FROM tourists WHERE tour_id=? AND status!='已退团'").get(tr.tour_id).c;
+    if (left === 0) {
+      const pending = db.prepare("SELECT id FROM resource_allocations WHERE tour_id=? AND status='待确认'").all(tr.tour_id);
+      pending.forEach(a => { inv.releaseAllocationTxn(a.id, '游客全部退团，待确认占用自动释放'); released.push(a.id); });
+    }
+  }
+  res.json({ ok: true, released });
 });
 
 router.delete('/tourists/:id', (req, res) => {
-  db.prepare('DELETE FROM tourists WHERE id=?').run(req.params.id);
-  res.json({ ok: true });
+  const tr = db.prepare('SELECT * FROM tourists WHERE id=?').get(req.params.id);
+  if (!tr) return res.status(404).json({ error: '游客不存在' });
+  db.prepare('DELETE FROM tourists WHERE id=?').run(tr.id);
+  let released = [];
+  const left = db.prepare("SELECT COUNT(*) c FROM tourists WHERE tour_id=? AND status!='已退团'").get(tr.tour_id).c;
+  if (left === 0) {
+    const pending = db.prepare("SELECT id FROM resource_allocations WHERE tour_id=? AND status='待确认'").all(tr.tour_id);
+    pending.forEach(a => { inv.releaseAllocationTxn(a.id, '游客全部退团，待确认占用自动释放'); released.push(a.id); });
+  }
+  res.json({ ok: true, released });
 });
 
 /* ---------------- 计调：航空切位 ---------------- */
@@ -243,9 +302,19 @@ router.post('/tours/:id/flights', (req, res) => {
   res.json(db.prepare('SELECT * FROM flight_bookings WHERE id=?').get(info.lastInsertRowid));
 });
 
-router.put('/flights/:id', (req, res) => simpleUpdate('flight_bookings', req, res,
-  ['direction', 'flight_no', 'flight_date', 'route', 'seats', 'unit_price', 'confirmed', 'remarks']));
-router.delete('/flights/:id', (req, res) => simpleDelete('flight_bookings', req, res));
+router.put('/flights/:id', (req, res) => {
+  const row = db.prepare('SELECT * FROM flight_bookings WHERE id=?').get(req.params.id);
+  if (!row) return res.status(404).json({ error: '记录不存在' });
+  if (row.allocation_id) return res.status(409).json({ error: '该切位来自供应商资源池，请通过占用记录修改/释放' });
+  simpleUpdate('flight_bookings', req, res,
+    ['direction', 'flight_no', 'flight_date', 'route', 'seats', 'unit_price', 'confirmed', 'remarks']);
+});
+router.delete('/flights/:id', (req, res) => {
+  const row = db.prepare('SELECT * FROM flight_bookings WHERE id=?').get(req.params.id);
+  if (!row) return res.status(404).json({ error: '记录不存在' });
+  if (row.allocation_id) return res.status(409).json({ error: '该切位来自供应商资源池，请释放对应占用记录' });
+  simpleDelete('flight_bookings', req, res);
+});
 
 /* ---------------- 计调：酒店控房 ---------------- */
 router.post('/tours/:id/hotels', (req, res) => {
@@ -263,9 +332,19 @@ router.post('/tours/:id/hotels', (req, res) => {
   res.json(db.prepare('SELECT * FROM hotel_bookings WHERE id=?').get(info.lastInsertRowid));
 });
 
-router.put('/hotels/:id', (req, res) => simpleUpdate('hotel_bookings', req, res,
-  ['hotel_name', 'room_type', 'rooms', 'check_in', 'check_out', 'night_price', 'confirmed', 'remarks']));
-router.delete('/hotels/:id', (req, res) => simpleDelete('hotel_bookings', req, res));
+router.put('/hotels/:id', (req, res) => {
+  const row = db.prepare('SELECT * FROM hotel_bookings WHERE id=?').get(req.params.id);
+  if (!row) return res.status(404).json({ error: '记录不存在' });
+  if (row.allocation_id) return res.status(409).json({ error: '该控房来自供应商资源池，请通过占用记录修改/释放' });
+  simpleUpdate('hotel_bookings', req, res,
+    ['hotel_name', 'room_type', 'rooms', 'check_in', 'check_out', 'night_price', 'confirmed', 'remarks']);
+});
+router.delete('/hotels/:id', (req, res) => {
+  const row = db.prepare('SELECT * FROM hotel_bookings WHERE id=?').get(req.params.id);
+  if (!row) return res.status(404).json({ error: '记录不存在' });
+  if (row.allocation_id) return res.status(409).json({ error: '该控房来自供应商资源池，请释放对应占用记录' });
+  simpleDelete('hotel_bookings', req, res);
+});
 
 /* ---------------- 计调：地接社 ---------------- */
 router.post('/tours/:id/local-services', (req, res) => {
@@ -280,9 +359,19 @@ router.post('/tours/:id/local-services', (req, res) => {
   res.json(db.prepare('SELECT * FROM local_services WHERE id=?').get(info.lastInsertRowid));
 });
 
-router.put('/local-services/:id', (req, res) => simpleUpdate('local_services', req, res,
-  ['agency_name', 'guide_name', 'guide_phone', 'vehicle', 'meals_plan', 'total_price', 'confirmed', 'remarks']));
-router.delete('/local-services/:id', (req, res) => simpleDelete('local_services', req, res));
+router.put('/local-services/:id', (req, res) => {
+  const row = db.prepare('SELECT * FROM local_services WHERE id=?').get(req.params.id);
+  if (!row) return res.status(404).json({ error: '记录不存在' });
+  if (row.allocation_id) return res.status(409).json({ error: '该地接安排来自供应商资源池，请通过占用记录修改/释放' });
+  simpleUpdate('local_services', req, res,
+    ['agency_name', 'guide_name', 'guide_phone', 'vehicle', 'meals_plan', 'total_price', 'confirmed', 'remarks']);
+});
+router.delete('/local-services/:id', (req, res) => {
+  const row = db.prepare('SELECT * FROM local_services WHERE id=?').get(req.params.id);
+  if (!row) return res.status(404).json({ error: '记录不存在' });
+  if (row.allocation_id) return res.status(409).json({ error: '该地接安排来自供应商资源池，请释放对应占用记录' });
+  simpleDelete('local_services', req, res);
+});
 
 /* ---------------- 其他成本 ---------------- */
 router.post('/tours/:id/other-costs', (req, res) => {
@@ -294,6 +383,196 @@ router.post('/tours/:id/other-costs', (req, res) => {
   res.json(db.prepare('SELECT * FROM other_costs WHERE id=?').get(info.lastInsertRowid));
 });
 router.delete('/other-costs/:id', (req, res) => simpleDelete('other_costs', req, res));
+
+/* ================= 供应商资源池 ================= */
+
+/* ---------- 供应商 ---------- */
+router.get('/suppliers', (req, res) => {
+  const rows = db.prepare(`
+    SELECT s.*, (SELECT COUNT(*) FROM resources r WHERE r.supplier_id=s.id) AS resource_count
+    FROM suppliers s ORDER BY s.type, s.id DESC`).all();
+  res.json(rows);
+});
+
+router.post('/suppliers', (req, res) => {
+  const b = req.body;
+  if (!b.name || !b.name.trim()) return res.status(400).json({ error: '请填写供应商名称' });
+  if (!inv.RESOURCE_TYPES.includes(b.type)) return res.status(400).json({ error: '供应商类型无效' });
+  const info = db.prepare(`INSERT INTO suppliers (name, type, contact, phone, status, remarks)
+    VALUES (?,?,?,?,?,?)`).run(
+    b.name.trim(), b.type, b.contact || '', b.phone || '', b.status || '合作中', b.remarks || '');
+  res.json(db.prepare('SELECT * FROM suppliers WHERE id=?').get(info.lastInsertRowid));
+});
+
+router.put('/suppliers/:id', (req, res) => {
+  const s = db.prepare('SELECT * FROM suppliers WHERE id=?').get(req.params.id);
+  if (!s) return res.status(404).json({ error: '供应商不存在' });
+  const b = req.body;
+  ['name', 'type', 'contact', 'phone', 'status', 'remarks'].forEach(f => { if (b[f] !== undefined) s[f] = b[f]; });
+  db.prepare('UPDATE suppliers SET name=?,type=?,contact=?,phone=?,status=?,remarks=? WHERE id=?')
+    .run(s.name, s.type, s.contact, s.phone, s.status, s.remarks, s.id);
+  res.json(db.prepare('SELECT * FROM suppliers WHERE id=?').get(s.id));
+});
+
+router.delete('/suppliers/:id', (req, res) => {
+  const id = req.params.id;
+  const used = db.prepare('SELECT COUNT(*) c FROM resources WHERE supplier_id=?').get(id).c;
+  if (used) return res.status(400).json({ error: `该供应商名下有 ${used} 条采购资源，请先删除资源或将供应商停用` });
+  db.prepare('DELETE FROM suppliers WHERE id=?').run(id);
+  res.json({ ok: true });
+});
+
+/* ---------- 采购资源（库存） ---------- */
+router.get('/resources', (req, res) => {
+  res.json(inv.listResources(req.query));
+});
+
+router.get('/resources/:id', (req, res) => {
+  const av = inv.getAvailability(req.params.id);
+  if (!av) return res.status(404).json({ error: '资源不存在' });
+  const { resource, ...rest } = av;
+  const supplier = db.prepare('SELECT * FROM suppliers WHERE id=?').get(resource.supplier_id);
+  res.json({ ...resource, supplier, availability: rest });
+});
+
+function validateResource(b) {
+  if (!inv.RESOURCE_TYPES.includes(b.type)) return '资源类型无效（航班/酒店/地接）';
+  if (!b.name || !b.name.trim()) return '请填写资源名称（航班号/酒店名称/地接产品）';
+  b.qty = Number(b.qty);
+  if (!(b.qty > 0) || !Number.isInteger(b.qty)) return '采购数量需为正整数';
+  b.unit_price = Number(b.unit_price) || 0;
+  if (b.unit_price < 0) return '采购单价不能为负';
+  if (!b.service_date) return '请选择服务日期（航班日期/入住起始日/地接日期）';
+  if (b.type === '酒店') {
+    if (!b.end_date || b.end_date <= b.service_date) return '酒店资源需填写晚于入住日的离店日期';
+  }
+  if (!b.supplier_id) return '请选择供应商';
+  if (!db.prepare('SELECT id FROM suppliers WHERE id=?').get(b.supplier_id)) return '供应商不存在';
+  return null;
+}
+
+router.post('/resources', (req, res) => {
+  const b = req.body;
+  const err = validateResource(b);
+  if (err) return res.status(400).json({ error: err });
+  const info = db.prepare(`INSERT INTO resources
+    (supplier_id, type, name, sub_name, route, direction, service_date, end_date, qty, unit_price, status, remarks)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    b.supplier_id, b.type, b.name.trim(), b.sub_name || '', b.route || '',
+    b.direction || '去程', b.service_date, b.type === '酒店' ? b.end_date : null,
+    b.qty, b.unit_price, b.status || '在售', b.remarks || '');
+  res.json(db.prepare('SELECT * FROM resources WHERE id=?').get(info.lastInsertRowid));
+});
+
+router.put('/resources/:id', (req, res) => {
+  const r = db.prepare('SELECT * FROM resources WHERE id=?').get(req.params.id);
+  if (!r) return res.status(404).json({ error: '资源不存在' });
+  const b = req.body;
+  // 名称/价格/状态可随时调整；数量与日期收窄前校验已有有效占用，防止把库存改穿
+  const next = { ...r, ...b };
+  next.qty = Number(next.qty); next.unit_price = Number(next.unit_price) || 0;
+  if (!(next.qty > 0) || !Number.isInteger(next.qty)) return res.status(400).json({ error: '采购数量需为正整数' });
+  if (next.type === '酒店' && (!next.end_date || next.end_date <= next.service_date)) {
+    return res.status(400).json({ error: '酒店资源离店日期需晚于入住日期' });
+  }
+
+  const testRow = { ...r, qty: next.qty, service_date: next.service_date, end_date: next.type === '酒店' ? next.end_date : null };
+  const allocations = db.prepare(
+    "SELECT * FROM resource_allocations WHERE resource_id=? AND status IN ('待确认','已确认')"
+  ).all(r.id);
+  for (const a of allocations) {
+    if (next.type === '酒店') {
+      if (a.start_date < next.service_date || (a.end_date || a.start_date) > next.end_date) {
+        return res.status(409).json({ error: `占用 #${a.id}（${a.tour_code || a.tour_id}，${a.start_date}~${a.end_date}）超出新的控房区间，请先释放或调整` });
+      }
+    }
+    const conflicts = inv.findConflicts(testRow, a.qty, a.start_date,
+      next.type === '酒店' ? a.end_date : null, a.id);
+    if (conflicts.length) {
+      return res.status(409).json({
+        error: inv.buildConflictMessage(testRow, conflicts),
+        conflicts, available: Math.min(...conflicts.map(c => c.available))
+      });
+    }
+  }
+
+  db.prepare(`UPDATE resources SET supplier_id=?,name=?,sub_name=?,route=?,direction=?,
+    service_date=?,end_date=?,qty=?,unit_price=?,status=?,remarks=? WHERE id=?`).run(
+    next.supplier_id, next.name, next.sub_name || '', next.route || '', next.direction || '去程',
+    next.service_date, next.type === '酒店' ? next.end_date : null,
+    next.qty, next.unit_price, next.status || '在售', next.remarks || '', r.id);
+
+  // 待确认占用联动的计调行单价跟随新采购价；已确认占用保留快照价，调价不影响既有团队毛利
+  allocations.filter(a => a.status === '待确认').forEach(a => inv.syncBooking(a.id));
+
+  res.json(db.prepare('SELECT * FROM resources WHERE id=?').get(r.id));
+});
+
+router.delete('/resources/:id', (req, res) => {
+  const result = handleTxn(res, () => inv.deleteResourceTxn(req.params.id));
+  if (result) res.json({ ok: true, ...result });
+});
+
+/* ---------- 资源余量 / 占用来源 ---------- */
+router.get('/resources/:id/availability', (req, res) => {
+  const av = inv.getAvailability(req.params.id);
+  if (!av) return res.status(404).json({ error: '资源不存在' });
+  res.json(av);
+});
+
+/* ---------- 占用（团队计调从资源池占位） ---------- */
+router.get('/allocations', (req, res) => {
+  const where = [];
+  const params = [];
+  if (req.query.tour_id) { where.push('a.tour_id=?'); params.push(req.query.tour_id); }
+  if (req.query.resource_id) { where.push('a.resource_id=?'); params.push(req.query.resource_id); }
+  if (req.query.status) { where.push('a.status=?'); params.push(req.query.status); }
+  const rows = db.prepare(`
+    SELECT a.*, r.type AS resource_type, r.name AS resource_name, r.sub_name AS resource_sub,
+      r.qty AS resource_qty, r.unit_price AS resource_price, r.status AS resource_status,
+      s.name AS supplier_name, p.name AS product_name
+    FROM resource_allocations a
+    JOIN resources r ON r.id=a.resource_id
+    JOIN suppliers s ON s.id=r.supplier_id
+    JOIN tours t ON t.id=a.tour_id
+    JOIN products p ON p.id=t.product_id
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+    ORDER BY a.id DESC`).all(...params);
+  res.json(rows);
+});
+
+router.post('/allocations', (req, res) => {
+  const result = handleTxn(res, () => inv.createAllocationTxn(req.body));
+  if (result) res.status(201).json(result.allocation);
+});
+
+router.get('/allocations/:id', (req, res) => {
+  const a = db.prepare(`
+    SELECT a.*, r.type AS resource_type, r.name AS resource_name, r.qty AS resource_qty,
+      r.unit_price AS resource_price, s.name AS supplier_name
+    FROM resource_allocations a
+    JOIN resources r ON r.id=a.resource_id
+    JOIN suppliers s ON s.id=r.supplier_id WHERE a.id=?`).get(req.params.id);
+  if (!a) return res.status(404).json({ error: '占用记录不存在' });
+  res.json(a);
+});
+
+router.put('/allocations/:id', (req, res) => {
+  const result = handleTxn(res, () => inv.updateAllocationTxn(req.params.id, req.body));
+  if (result) res.json(result.allocation);
+});
+
+// 确认占用（锁定成本快照）
+router.post('/allocations/:id/confirm', (req, res) => {
+  const result = handleTxn(res, () => inv.confirmAllocationTxn(req.params.id));
+  if (result) res.json(result.allocation);
+});
+
+// 释放占用（联动删除计调表行、恢复余量）
+router.post('/allocations/:id/release', (req, res) => {
+  const result = handleTxn(res, () => inv.releaseAllocationTxn(req.params.id, req.body?.reason || '手工释放'));
+  if (result) res.json(result.allocation);
+});
 
 function simpleUpdate(table, req, res, fields) {
   const row = db.prepare(`SELECT * FROM ${table} WHERE id=?`).get(req.params.id);
