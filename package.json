@@ -10,7 +10,8 @@
     "dev:web": "npm --prefix client run dev",
     "build": "npm --prefix client run build",
     "start": "node server/index.js",
-    "seed": "node server/seed.js"
+    "seed": "node server/seed.js",
+    "test": "node --test server/test/"
   },
   "dependencies": {
     "better-sqlite3": "^11.10.0",

@@ -8,7 +8,8 @@
 
 ```bash
 npm run install:all     # 安装后端与前端依赖
-npm run seed            # 写入演示数据（2条线路、2个团、27名游客、全套计调资源）
+npm run seed            # 写入演示数据（2条线路、3个团、40名游客、4家供应商、
+                         # 航班/酒店/地接资源池与跨团占用，含调价后成本快照场景）
 npm run dev             # 同时启动 API(4000) 与前端开发服务器(5173)
 ```
 
@@ -40,13 +41,24 @@ npm run build && npm start   # http://localhost:4000 直接访问
 - **酒店控房**：酒店、房型、间数、入住/离店日期、晚均价；自动按晚数计成本
 - **地接社确认**：地接社、地接导游及电话、用车、用餐安排、打包费用、确认状态
 - **其他成本**：门票、保险、领队费用等杂项
+- 每条计调可选择**从供应商资源池占用库存**（也可不选，保留手工计调）；占用在「待确认 → 已确认 → 已释放」间流转，支持释放与重新占用
 
-### 4. 收入 vs 成本毛利估算（单团实时）
+### 4. 供应商资源池与库存冲突控制
+- **统一资源池**（`resources`）：航班座位（按航班日期）、酒店每日房量（按入住日期逐晚一行）、地接服务容量（按服务日期）；记录供应商、日期、采购数量、采购单价与状态（开放/停售）
+- 酒店可按首晚~最后一晚**批量建池**，每晚独立房量；计调控房时**按入住日期逐晚校验**
+- **可用量 = 采购数量 − 所有团队「待确认 + 已确认」的有效占用**（已释放不扣减）；冲突时返回**剩余量与具体日期**（航班返回当日余量，酒店返回每个不足的入住夜）
+- 创建、修改、确认占用均在 **`BEGIN IMMEDIATE` 数据库事务**内完成，SQLite 写事务串行化，**并发请求不会超卖**
+- **成本快照**：确认占用时按当时采购单价锁定 `unit_price_snapshot/cost_amount`；此后供应商调价只影响待确认占用，**既有已确认团队毛利不变**；撤销确认后改按现价重估
+- **释放规则**：退订/释放占用、删除计调记录、取消（删除）团队时自动归还库存；删除资源时待确认占用自动释放、存在已确认占用则禁止删除
+- 资源池管理页：供应商与资源 CRUD、停售/开售、逐晚余量、**占用来源**（哪个团、哪天、占多少、快照价）
+- 团队计调页：实时余量、逐晚冲突徽标、顶部冲突横幅、占用来源弹窗；手工计调记录（无资源池关联）完全兼容
+
+### 5. 收入 vs 成本毛利估算（单团实时）
 - 收入：在团游客实收团费合计
-- 支出：切位（座位数×切位价）+ 控房（间数×晚均价×晚数）+ 地接 + 其他
+- 支出：资源池占用快照成本（切位/控房/地接）+ 未入池手工计调成本 + 其他
 - 预估毛利与毛利率，成本超收入时红色预警；工作台汇总全部团队
 
-### 5. 出团通知书
+### 6. 出团通知书
 - 一键**自动生成**：行程信息、航班、每日行程（景点/用餐/住宿）、酒店、地接导游/用车/用餐、游客特殊需求清单
 - 生成后可在线编辑；存档后可「发送给游客」（当前为模拟发送并记录发送时间/人数，实际对接短信/邮件网关时替换 `POST /api/notices/:id/send` 即可）
 - 支持预览、打印 / 另存 PDF
@@ -57,13 +69,17 @@ npm run build && npm start   # http://localhost:4000 直接访问
 server/
   index.js     Express 入口（API + 生产静态托管）
   db.js        SQLite 表结构（products/itinerary_days/tours/tourists/
-               flight_bookings/hotel_bookings/local_services/other_costs/notices）
-  routes.js    全部业务接口与校验、满团规则、通知书文案生成
-  helpers.js   身份证校验、财务计算、团号生成
-  seed.js      演示数据
+               flight_bookings/hotel_bookings/local_services/other_costs/notices/
+               suppliers/resources/resource_occupancies）
+  pool.js      资源池引擎：BEGIN IMMEDIATE 事务、逐晚容量校验、占用流转、成本快照、释放
+  routes.js    全部业务接口与校验、满团规则、库存冲突 409（含 conflicts 日期/剩余量）
+  helpers.js   身份证校验、财务计算（快照成本优先）、团号生成
+  seed.js      演示数据（供应商、资源池、跨团占用、调价后成本快照场景）
+  test/pool.test.js  并发占用/跨日期控房/释放/成本快照集成测试（npm test）
 client/src/
-  pages/       工作台、产品列表/编辑、团队列表/新建/详情
-  components/tour/  团队详情四个标签页：收客 / 计调 / 财务 / 通知书
+  pages/       工作台、产品、团队、PoolPage 供应商资源池
+  components/tour/   团队详情四个标签页：收客 / 计调 / 财务 / 通知书
+  components/pool/   资源占用来源弹窗
 ```
 
 ## 主要 API
@@ -71,10 +87,28 @@ client/src/
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET/POST | `/api/products` `/api/products/:id` | 产品 CRUD（含 itinerary 日程数组） |
-| GET/POST | `/api/tours` `/api/tours/:id` | 团队列表/详情（聚合游客、计调、财务） |
+| GET/POST | `/api/tours` `/api/tours/:id` | 团队列表/详情（聚合游客、计调、占用、逐晚余量、财务） |
 | POST | `/api/tours/:id/tourists` | 报名（满团/校验/去重拦截） |
-| PATCH/DELETE | `/api/tourists/:id` | 退团、修改、删除 |
-| POST | `/api/tours/:id/flights` `/hotels` `/local-services` `/other-costs` | 计调资源 |
+| PATCH/DELETE | `/api/tourists/:id` | 退团、修改、删除（删除团队自动释放占用） |
+| POST | `/api/tours/:id/flights` `/hotels` `/local-services` `/other-costs` | 计调资源（带 `resource_id` 即占用资源池，事务内防超卖） |
+| PUT/DELETE | `/api/flights/:id` `/hotels/:id` `/local-services/:id` | 修改（事务内重新校验）/ 删除（释放占用） |
+| POST | `/api/(flights\|hotels\|local-services)/:id/release` `/reoccupy` | 释放库存（记录保留）/ 重新占用 |
+| GET/POST/PUT/DELETE | `/api/suppliers` `/api/suppliers/:id` | 供应商 CRUD、停用 |
+| GET/POST/PUT/DELETE | `/api/resources` `/api/resources/:id` | 资源池 CRUD、停售/开售、调价；酒店支持 `end_date` 批量建池 |
+| GET | `/api/resources/:id/sources` | 实时余量 + 各团队占用来源（快照价） |
 | POST | `/api/tours/:id/notices/generate` | 自动生成通知书文案 |
 | POST | `/api/notices/:id/send` | 发送（模拟网关） |
 | GET | `/api/stats` | 工作台汇总 |
+
+> 库存冲突统一返回 **HTTP 409** 与 `{ error, conflicts: [{ resource_id, date, need, available, remaining }] }`；
+> 酒店冲突的 `conflicts` 逐晚列出所有不足的入住日期。
+
+## 测试
+
+```bash
+npm test     # node --test：12 个集成测试（临时 SQLite 库，不影响开发数据）
+```
+
+覆盖：并发占用防超卖（`Promise.all` 同时下单）、酒店跨日期逐日控房与冲突日期、释放/重新占用、
+缩短入住晚数自动释放多余晚数、取消团队释放、确认后供应商调价不影响毛利（成本快照）、
+采购量收缩/停售/删除资源的规则、手工计调兼容性、占用来源查询、酒店批量建池。
