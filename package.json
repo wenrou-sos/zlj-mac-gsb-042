@@ -1,0 +1,23 @@
+{
+  "name": "travel-ops-platform",
+  "version": "1.0.0",
+  "private": true,
+  "description": "旅行社组团与计调操作平台",
+  "scripts": {
+    "install:all": "npm install && npm --prefix client install",
+    "dev": "concurrently -n server,web -c green,cyan \"npm run dev:server\" \"npm run dev:web\"",
+    "dev:server": "node server/index.js",
+    "dev:web": "npm --prefix client run dev",
+    "build": "npm --prefix client run build",
+    "start": "node server/index.js",
+    "seed": "node server/seed.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "cors": "^2.8.5",
+    "express": "^4.21.0"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.1"
+  }
+}
